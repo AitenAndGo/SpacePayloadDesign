@@ -23,6 +23,7 @@ pico_sdk_init()
 add_executable(optical_payload_app
     src/main.c
     src/maxon.c
+    src/tcp_server.c
 )
 
 target_include_directories(optical_payload_app PRIVATE
@@ -32,7 +33,7 @@ target_include_directories(optical_payload_app PRIVATE
 
 target_link_libraries(optical_payload_app
     pico_stdlib
-    pico_cyw43_arch_none
+    pico_cyw43_arch_lwip_threadsafe_background
 )
 
 pico_enable_stdio_usb(optical_payload_app 1)

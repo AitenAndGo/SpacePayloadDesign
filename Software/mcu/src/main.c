@@ -6,9 +6,13 @@
 
 #include "app.h"
 #include "maxon.h"
-#include <pico/cyw43_arch.h>
-#include <pico/stdio.h>
-#include <pico/time.h>
+#include "tcp_server.h"
+#include "pico/cyw43_arch.h"
+#include "pico/stdio.h"
+#include "pico/time.h"
+#include <cyw43.h>
+#include <cyw43_country.h>
+#include <stdio.h>
 
 /* -------------------------------------------------------------------------
  * State and transition request (set by check_commands / check_autonomous_events)
@@ -92,30 +96,35 @@ void state_off_handler(void)
 {
     /* Powered down; motors not driven */
     maxon_disable();
+    printf("State OFF\n");
 }
 
 void state_boot_handler(void)
 {
     /* Start-up software: init, then wait for BOOT_TO_SAFE_DELAY_MS */
     maxon_disable();
+    printf("State BOOT\n");
 }
 
 void state_safe_handler(void)
 {
     /* Stand-by: low power, motors disabled, ready for MAINTENANCE / CONFIGURATION / OFF / BOOT */
     maxon_disable();
+    printf("State SAFE\n");
 }
 
 void state_maintenance_handler(void)
 {
     /* Diagnostics / updates; motors may be enabled for testing (stub) */
     maxon_disable();  /* or maxon_enable() for diagnostic motion when implemented */
+    printf("State MAINTENANCE\n");
 }
 
 void state_configuration_handler(void)
 {
     /* Parameter set; no nominal motion */
     maxon_disable();
+    printf("State CONFIGURATION\n");
 }
 
 void state_nominal_handler(void)
@@ -123,6 +132,7 @@ void state_nominal_handler(void)
     /* Primary mission: operate motors according to data taking plan (stub) */
     maxon_enable();
     /* maxon_set_velocity(...) or maxon_set_position(...) when plan is active */
+    printf("State NOMINAL\n");
 }
 
 /* -------------------------------------------------------------------------
@@ -131,8 +141,23 @@ void state_nominal_handler(void)
 void system_init(void)
 {
     stdio_init_all();
-    if (cyw43_arch_init())
-        return;  /* no LED if CYW43 init fails */
+    sleep_ms(5000);
+
+    if (cyw43_arch_init()) {
+        printf("Wi-Fi init failed\n");
+        return;
+    }
+
+    // Enable AP mode
+    cyw43_arch_enable_ap_mode(
+        "PICO_AP",
+        "1234567890",
+        CYW43_AUTH_WPA2_AES_PSK
+    );
+
+    printf("AP IP now: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
+
+    start_tcp_server();
     maxon_init();
 }
 
@@ -148,7 +173,7 @@ int main(void)
     transition_to(STATE_BOOT);
     boot_done_at = make_timeout_time_ms(BOOT_TO_SAFE_DELAY_MS);
 
-    while (1) {
+    while (true) {
         check_commands();
         check_autonomous_events();
 
@@ -156,14 +181,14 @@ int main(void)
             transition_to(requested_transition);
 
         switch (current_state) {
-            case STATE_OFF:   state_off_handler();   break;
-            case STATE_BOOT:  state_boot_handler(); break;
-            case STATE_SAFE:  state_safe_handler(); break;
-            case STATE_MAINTENANCE:  state_maintenance_handler();  break;
+            case STATE_OFF: state_off_handler(); break;
+            case STATE_BOOT: state_boot_handler(); break;
+            case STATE_SAFE: state_safe_handler(); break;
+            case STATE_MAINTENANCE: state_maintenance_handler(); break;
             case STATE_CONFIGURATION: state_configuration_handler(); break;
-            case STATE_NOMINAL:       state_nominal_handler();       break;
+            case STATE_NOMINAL: state_nominal_handler(); break;
         }
 
-        sleep_ms(10);
+        sleep_ms(1000);
     }
 }
