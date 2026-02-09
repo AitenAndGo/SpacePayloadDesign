@@ -43,5 +43,5 @@ while True:
     cs = checksum(frame)
     s.sendall(frame + struct.pack("!B", cs))
 
-    reply = s.recv(1024)
-    print("RX:", reply)
+    # reply = s.recv(1024)
+    # print("RX:", reply)

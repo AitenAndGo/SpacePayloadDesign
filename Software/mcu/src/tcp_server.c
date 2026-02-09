@@ -30,13 +30,9 @@ static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t 
         uint8_t cs = checksum(buf, 5);
 
         if (cs == buf[5]) {
-            uint8_t cmd = buf[2];
-            uint8_t p1  = buf[3];
-            uint8_t p2  = buf[4];
-
-            printf("CMD=%d P1=%d P2=%d\n", cmd, p1, p2);
-            command = cmd; param1 = p1; param2 = p2;
-            // TODO: execute command
+            command = buf[2];
+            param1  = buf[3];
+            param2  = buf[4];
         } else {
             printf("Checksum error\n");
         }

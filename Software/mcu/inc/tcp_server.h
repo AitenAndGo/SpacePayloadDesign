@@ -1,31 +1,20 @@
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
 
-/* =========================
- * TCP Server Configuration
- * ========================= */
+#include <stdint.h>
+#include "lwip/tcp.h"
 
-/* TCP listening port */
 #define TCP_SERVER_PORT 4242
+
+// Use -1 to indicate no new command pending
+#define CMD_NONE -1
 
 extern volatile int command;
 extern volatile int param1;
 extern volatile int param2;
+extern struct tcp_pcb *server_pcb; // Expose PCB to send telemetry from main
 
-/* =========================
- * Public API
- * ========================= */
-
-/**
- * @brief Initialize and start the TCP server.
- *
- * This function creates a TCP listening socket on the Pico 2W,
- * binds it to the configured port, and registers receive callbacks.
- *
- * It shall be called after Wi-Fi initialization and connection.
- */
 void start_tcp_server(void);
-
-// void set_ap_ip(void);
+void send_telemetry(struct tcp_pcb *pcb, uint8_t status, uint16_t data, uint32_t timestamp);
 
 #endif /* TCP_SERVER_H */

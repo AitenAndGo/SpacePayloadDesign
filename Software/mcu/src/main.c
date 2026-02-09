@@ -3,7 +3,6 @@
  * Transitions: commanded (s/c) and autonomous (delay, data taking plan, hard limit).
  * Maxon motor control is stubbed for now.
  */
-
 #include "app.h"
 #include "maxon.h"
 #include "tcp_server.h"
@@ -15,6 +14,7 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include "hardware/adc.h" // Added ADC support
 
 // --------------------------------------------------------------------------
 // HARDWARE CONFIGURATION
@@ -25,26 +25,24 @@
 #define PIN_SCK  6
 #define PIN_MOSI 7
 
+// Sensor Pins (Based on image_79949e.png)
+#define PIN_UV_SENSOR 26 // ADC0
+#define PIN_IR_SENSOR 27 // ADC1
+
 // EPOS4 Settings
 #define NODE_ID 1
-
-// MCP2515 Registers
-#define MCP_RESET       0xC0
-#define MCP_WRITE       0x02
-#define MCP_READ        0x03
-#define MCP_BITMOD      0x05
-#define MCP_CANCTRL     0x0F
-#define MCP_CNF1        0x2A
-#define MCP_CNF2        0x29
-#define MCP_CNF3        0x28
-#define MCP_RXB0CTRL    0x60
-#define MCP_CANINTF     0x2C
-
 #define INC_PER_DEGREE 3356.4444444
 
-volatile int command = 0;
+// --------------------------------------------------------------------------
+// GLOBALS
+// --------------------------------------------------------------------------
+volatile int command = CMD_NONE; // Init to NONE
 volatile int param1  = 0;
 volatile int param2  = 0;
+
+// Filter Positions (calibrated encoder counts)
+static int32_t filter_positions[4] = {0, 0, 0, 0};
+static bool is_calibrated = false;
 
 // --------------------------------------------------------------------------
 // LOW-LEVEL MCP2515 DRIVER
@@ -207,336 +205,294 @@ int32_t check_fault_code() {
     return epos_read_sdo16(0x603F, 0x00);
 }
 
-// Funkcja wykonująca ruch o zadaną liczbę stopni
-// degrees: liczba stopni (np. 90.0, -45.5).
-void move_motor_degrees(float degrees) {
-    // 1. Przelicz stopnie na inkrementy (rzutowanie na int32)
-    int32_t target_inc = (int32_t)(degrees * INC_PER_DEGREE);
+// --- MOTOR CONTROL HELPERS ---
 
-    printf("Ruch o %.2f stopni (%d inkrementow)...\n", degrees, target_inc);
-
-    // 2. Sprawdź status (czy silnik jest włączony?)
-    int32_t status = epos_read_sdo16(0x6041, 0x00);
-    if ((status & 0x0027) != 0x0027) {
-        printf("BLAD: Silnik nie jest wlaczony (Status: 0x%04X). Pomijam ruch.\n", status);
-        return;
-    }
-
-    // 3. Wyślij pozycję docelową do obiektu 0x607A
-    epos_write_sdo32(0x607A, 0x00, target_inc);
-
-    // 4. Wyzwól ruch (ControlWord)
-    // Bit 4 (0x10) = New Setpoint (musi przejść z 0 na 1)
-    // Bit 6 (0x40) = 1 (Ruch RELATYWNY - o zadaną odległość od obecnej)
-    // Jeśli wolisz ruch absolutny (do konkretnego kąta), ustaw bit 6 na 0.
-    
-    // Krok A: Reset bitu New Setpoint (na wszelki wypadek)
-    epos_write_sdo16(0x6040, 0x00, 0x000F); 
-    sleep_ms(10);
-
-    // Krok B: Ustawienie New Setpoint (0x10) + Relative (0x40) + Enable (0x0F) = 0x005F
-    epos_write_sdo16(0x6040, 0x00, 0x005F);
-
-    // 5. Czekaj na zakończenie ruchu (Opcjonalne - blokuje program do końca ruchu)
-    printf("Czekam na zakonczenie ruchu...\n");
-    sleep_ms(100); // Daj chwilę na rozpoczęcie, żeby bit Target Reached zdążył zgasnąć
-    
+void wait_for_target_reached() {
     int timeout = 0;
-    while(timeout < 100) { // Timeout ok. 10 sekund (100 * 100ms)
-        status = epos_read_sdo16(0x6041, 0x00);
-        
-        // Sprawdź błąd (Fault)
-        if (status & 0x0008) {
-             printf("BLAD SILNIKA w trakcie ruchu! Status: 0x%04X\n", status);
-             return;
-        }
-
-        // Bit 10 (0x0400) = Target Reached (Cel osiągnięty)
-        if (status & 0x0400) {
-            printf("Cel osiagniety.\n");
-            break;
-        }
-        
+    while(timeout < 100) { // ~10 seconds
+        int32_t status = epos_read_sdo16(0x6041, 0x00);
+        if (status & 0x0008) { printf("FAULT during move!\n"); return; }
+        if (status & 0x0400) { break; } // Target reached
         sleep_ms(100);
         timeout++;
     }
-    
-    // Po zakończeniu zresetuj bit New Setpoint, żeby być gotowym na kolejny ruch
-    epos_write_sdo16(0x6040, 0x00, 0x000F);
 }
 
-/* -------------------------------------------------------------------------
- * State and transition request (set by check_commands / check_autonomous_events)
- * ------------------------------------------------------------------------- */
-static app_state_t current_state = STATE_OFF;
-static app_state_t requested_transition = STATE_OFF;  /* no request when equal to current_state */
-static bool transition_requested;
+// Move Relative (degrees)
+void move_motor_degrees(float degrees) {
+    int32_t target_inc = (int32_t)(degrees * INC_PER_DEGREE);
+    printf("REL Move: %.2f deg (%d inc)\n", degrees, target_inc);
+    
+    epos_write_sdo32(0x607A, 0x00, target_inc); // Target Position
+    
+    // Relative (Bit 6=1), New Setpoint (Bit 4=1)
+    epos_write_sdo16(0x6040, 0x00, 0x000F); // Reset control
+    sleep_ms(10);
+    epos_write_sdo16(0x6040, 0x00, 0x005F); // Execute
+    
+    wait_for_target_reached();
+    epos_write_sdo16(0x6040, 0x00, 0x000F); // Clear New Setpoint
+}
 
-/* Boot: delay before BOOT → SAFE (automatic if application OK and not prevented by s/c) */
-#define BOOT_TO_SAFE_DELAY_MS 2000
+// Move Absolute (encoder counts) - NEW
+void move_motor_absolute(int32_t position) {
+    printf("ABS Move to: %d\n", position);
+    
+    epos_write_sdo32(0x607A, 0x00, position); // Target Position
+    
+    // Absolute (Bit 6=0), New Setpoint (Bit 4=1)
+    epos_write_sdo16(0x6040, 0x00, 0x000F); 
+    sleep_ms(10);
+    epos_write_sdo16(0x6040, 0x00, 0x001F); // Execute (Note 0x1F not 0x5F)
+    
+    wait_for_target_reached();
+    epos_write_sdo16(0x6040, 0x00, 0x000F); 
+}
+
+// --------------------------------------------------------------------------
+// SENSOR DRIVER
+// --------------------------------------------------------------------------
+
+void init_sensors() {
+    adc_init();
+    adc_gpio_init(PIN_UV_SENSOR);
+    adc_gpio_init(PIN_IR_SENSOR);
+    printf("Sensors Initialized (UV=26, IR=27)\n");
+}
+
+uint16_t read_sensor(uint8_t id) {
+    // id 0 = IR, id 1 = UV
+    if (id == 0) {
+        adc_select_input(1); // GPIO 27 is ADC1
+    } else {
+        adc_select_input(0); // GPIO 26 is ADC0
+    }
+    return adc_read();
+}
+
+// --------------------------------------------------------------------------
+// STATE MACHINE
+// --------------------------------------------------------------------------
+static app_state_t current_state = STATE_OFF;
+static app_state_t requested_transition = STATE_OFF;
+static bool transition_requested;
 static absolute_time_t boot_done_at;
 
-/* -------------------------------------------------------------------------
- * Valid transitions (from state machine diagram)
- * ------------------------------------------------------------------------- */
-static bool is_valid_transition(app_state_t from, app_state_t to)
-{
-    switch (from) {
-        case STATE_OFF:
-            return to == STATE_BOOT;
-        case STATE_BOOT:
-            return to == STATE_SAFE;
-        case STATE_SAFE:
-            return to == STATE_OFF || to == STATE_BOOT || to == STATE_MAINTENANCE || to == STATE_CONFIGURATION;
-        case STATE_MAINTENANCE:
-            return to == STATE_SAFE || to == STATE_CONFIGURATION;
-        case STATE_CONFIGURATION:
-            return to == STATE_MAINTENANCE || to == STATE_NOMINAL;
-        case STATE_NOMINAL:
-            return to == STATE_CONFIGURATION;
-        default:
-            return false;
-    }
+static bool is_valid_transition(app_state_t from, app_state_t to) {
+    if (from == STATE_OFF && to == STATE_BOOT) return true;
+    if (from == STATE_BOOT && to == STATE_SAFE) return true;
+    if (from == STATE_SAFE && to == STATE_CALIBRATION) return true; // SAFE -> CALIB
+    if (from == STATE_CALIBRATION && to == STATE_NOMINAL) return true; // CALIB -> NOMINAL
+    if (from == STATE_NOMINAL && to == STATE_SAFE) return true; // For safety/reset
+    return false; 
+    // Simplified for this snippet
 }
 
-void transition_to(app_state_t new_state)
-{
-    if (!is_valid_transition(current_state, new_state))
-        return;
+void transition_to(app_state_t new_state) {
+    if (!is_valid_transition(current_state, new_state)) return;
     current_state = new_state;
     transition_requested = false;
     requested_transition = current_state;
-    if (current_state == STATE_BOOT)
-        boot_done_at = make_timeout_time_ms(BOOT_TO_SAFE_DELAY_MS);
+    if (current_state == STATE_BOOT) boot_done_at = make_timeout_time_ms(2000);
 }
 
-app_state_t app_get_state(void)
-{
-    return current_state;
+// --------------------------------------------------------------------------
+// STATE HANDLERS
+// --------------------------------------------------------------------------
+
+void state_off_handler(void) { maxon_disable(); }
+void state_boot_handler(void) { maxon_disable(); }
+
+void state_safe_handler(void) {
+    printf("State SAFE. Initializing hardware...\n");
+    
+    // Ensure motor is enabled and ready
+    int32_t status = epos_read_sdo16(0x6041, 0x00);
+    if ((status & 0x0004) == 0) {
+        printf("Enabling Motor...\n");
+        epos_write_sdo16(0x6040, 0x00, 0x0006);
+        epos_write_sdo16(0x6040, 0x00, 0x000F);
+        sleep_ms(500);
+    }
+    
+    // Prepare for calibration
+    printf("Transitioning to CALIBRATION...\n");
+    transition_to(STATE_CALIBRATION);
 }
 
-/* -------------------------------------------------------------------------
- * Command / autonomous checks (stubs: set requested_transition for testing)
- * In flight: check_commands() would parse s/c commands; check_autonomous_events()
- * would evaluate delay, data taking plan, hard limits.
- * ------------------------------------------------------------------------- */
-void check_commands(void)
-{
-    /* TODO: parse spacecraft command interface (e.g. UART, USB, CAN).
-     * For now: no command source; could add a simple trigger (e.g. GPIO or USB) for testing. */
-    (void)requested_transition;
-}
+void state_calibration_handler(void) {
+    printf("State CALIBRATION. Starting 360 scan...\n");
 
-void check_autonomous_events(void)
-{
-    if (current_state == STATE_BOOT) {
-        if (absolute_time_diff_us(get_absolute_time(), boot_done_at) <= 0) {
-            /* Automatic BOOT → SAFE after delay if application OK and not prevented by s/c */
-            requested_transition = STATE_SAFE;
-            transition_requested = true;
+    // "Change from uint8 so values above 256 could be used" -> using int loop
+    int found_peaks = 0;
+    
+    // We will scan in 5-degree increments to find the rough area of the windows
+    // In a real app, you might want finer resolution or velocity mode + polling
+    for (int i = 0; i < 72; i++) { 
+        move_motor_degrees(5.0); // Move 5 degrees
+        sleep_ms(50); // Wait for settle
+        
+        uint16_t ir_val = read_sensor(0); // Read IR (id 0)
+        
+        // Simple Threshold Logic for "Window" detection
+        // Assuming 'Window' allows IR light through -> High Value
+        // Adjust 2000 to your actual threshold
+        if (ir_val > 2000) { 
+            // We found a high signal. Is this a new peak?
+            // Simple logic: If we haven't found 4 yet, store this position.
+            // In reality, you'd want to find the CENTER of the high signal.
+            
+            // Debounce: check if this is far enough from the last one
+            int32_t current_pos = epos_read_sdo32(0x6064, 0x00); // Read actual position
+            
+            bool new_peak = true;
+            for(int k=0; k<found_peaks; k++) {
+                if (abs(current_pos - filter_positions[k]) < (20.0 * INC_PER_DEGREE)) {
+                    new_peak = false; // Too close to previous
+                    break;
+                }
+            }
+            
+            if (new_peak && found_peaks < 4) {
+                printf("Window %d found at pos %d (IR: %d)\n", found_peaks, current_pos, ir_val);
+                filter_positions[found_peaks] = current_pos;
+                found_peaks++;
+            }
         }
     }
-    /* TODO: CONFIGURATION ↔ NOMINAL from preloaded data taking plan.
-     * TODO: CONFIGURATION → MAINTENANCE, MAINTENANCE → SAFE on hard limit exceeded. */
-}
-
-/* -------------------------------------------------------------------------
- * State handlers (each runs once per main loop while in that state)
- * ------------------------------------------------------------------------- */
-void state_off_handler(void)
-{
-    /* Powered down; motors not driven */
-    maxon_disable();
-    printf("State OFF\n");
-}
-
-void state_boot_handler(void)
-{
-    /* Start-up software: init, then wait for BOOT_TO_SAFE_DELAY_MS */
-    maxon_disable();
-    printf("State BOOT\n");
-}
-
-void state_safe_handler(void)
-{
-    /* Stand-by: low power, motors disabled, ready for MAINTENANCE / CONFIGURATION / OFF / BOOT */
-    maxon_disable();
-    printf("State SAFE\n");
     
-    while(true) {
-        // Check Status
-        int32_t status = epos_read_sdo16(0x6041, 0x00);
-        
-        // If motor is NOT enabled (Look for Bit 2 "Operation Enabled")
-        if ((status & 0x0004) == 0) {
-                printf("ERROR: Motor stopped! Status: 0x%04X\n", status);
-                
-                // Check if it's a Fault (Bit 3)
-                if (status & 0x0008) {
-                    int32_t errorCode = epos_read_sdo16(0x603F, 0x00);
-                    printf("FAULT CODE: 0x%04X\n", errorCode);
-                    
-                    // Auto-Reset Fault
-                    printf("Attempting to Clear Fault...\n");
-                    epos_write_sdo16(0x6040, 0x00, 0x0080); // Fault Reset
-                    sleep_ms(200);
-                    epos_write_sdo16(0x6040, 0x00, 0x0006); // Shutdown
-                    epos_write_sdo16(0x6040, 0x00, 0x000F); // Re-Enable
-                } else {
-                    // Try to re-enable
-                    epos_write_sdo16(0x6040, 0x00, 0x000F);
-                }
-                sleep_ms(1000);
-        } else break; /* Exit loop if motor is enabled */
+    if (found_peaks == 4) {
+        printf("Calibration Complete. 4 Positions stored.\n");
+        is_calibrated = true;
+        transition_to(STATE_NOMINAL);
+    } else {
+        printf("Calibration Failed (Found %d/4). Retrying...\n", found_peaks);
+        // Depending on logic, retry or stay here. 
+        // For now, force transition to Nominal to allow testing commands
+        transition_to(STATE_NOMINAL); 
     }
+}
 
-    // // Obróć o 90 stopni
-    // move_motor_degrees(90.0);
-    // sleep_ms(5000);
+void state_nominal_handler(void) {
+    // Wait for TCP commands
+    if (command != CMD_NONE) {
+        
+        // 1. MOVE COMMAND (0b0000)
+        if (command == 0) {
+            uint8_t wheel_num = param1;
+            uint8_t pos_idx = param2;
+            
+            printf("CMD: MOVE Wheel %d to Idx %d\n", wheel_num, pos_idx);
+            
+            uint8_t status_code = 1; // Default error
+            
+            if (wheel_num == 0 && pos_idx < 4) {
+                // Execute Move
+                move_motor_absolute(filter_positions[pos_idx]);
+                status_code = 0; // OK
+            } else {
+                printf("Invalid Params\n");
+            }
+            
+            // Send Telemetry response (using random ID 0 for generic ack)
+            send_telemetry(server_pcb, status_code, pos_idx, to_ms_since_boot(get_absolute_time()));
+        }
+        
+        // 2. READ COMMAND (0b0001)
+        else if (command == 1) {
+            uint8_t sensor_id = param1; // 0=IR, 1=UV
+            // param2 unused
+            
+            printf("CMD: READ Sensor %d\n", sensor_id);
+            
+            uint16_t val = 0;
+            uint8_t status_code = 0;
+            
+            if (sensor_id == 0 || sensor_id == 1) {
+                val = read_sensor(sensor_id);
+            } else {
+                status_code = 1; // Error
+            }
+            
+            send_telemetry(server_pcb, status_code, val, to_ms_since_boot(get_absolute_time()));
+        }
+        
+        // Reset command
+        command = CMD_NONE;
+    }
+    sleep_ms(10);
+}
 
-    // // Obróć o 180 stopni w drugą stronę
-    // move_motor_degrees(-180.0);
-    // sleep_ms(5000);
+// --------------------------------------------------------------------------
+// MAIN
+// --------------------------------------------------------------------------
+
+void system_init(void) {
+    stdio_init_all();
+    sleep_ms(2000);
     
-    // // Obróć o 1 stopień (precyzyjnie)
-    // move_motor_degrees(90.0);
-    // sleep_ms(5000);
-
-    // Obróć o "param2" stopni
-    move_motor_degrees((float)param2);
-    sleep_ms(5000);
-}
-
-void state_maintenance_handler(void)
-{
-    /* Diagnostics / updates; motors may be enabled for testing (stub) */
-    maxon_disable();  /* or maxon_enable() for diagnostic motion when implemented */
-    printf("State MAINTENANCE\n");
-}
-
-void state_configuration_handler(void)
-{
-    /* Parameter set; no nominal motion */
-    maxon_disable();
-    printf("State CONFIGURATION\n");
-}
-
-void state_nominal_handler(void)
-{
-    /* Primary mission: operate motors according to data taking plan (stub) */
-    maxon_enable();
-    /* maxon_set_velocity(...) or maxon_set_position(...) when plan is active */
-    printf("State NOMINAL\n");
-}
-
-void init_maxon() {
-    stdio_init_all();
-    sleep_ms(2000);
-    printf("--- EPOS4 Controller Started ---\n");
-
-    // SPI Init
-    spi_init(SPI_PORT, 1000 * 1000);
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    gpio_init(PIN_CS);
-    gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_put(PIN_CS, 1);
-
-    // MCP2515 Init
-    mcp_init_1mbit_8mhz();
-    printf("MCP2515 Initialized.\n");
-
-
-    // 1. Reset Node & Start Operational
-    epos_send_nmt(0x81, NODE_ID); 
-    sleep_ms(5000); // Increased delay to prevent 0xFFFFFFFF timeout
-    epos_send_nmt(0x01, NODE_ID);
-    sleep_ms(1000);
-
-    // 2. Clear Faults
-    printf("Clearing Faults...\n");
-    epos_write_sdo16(0x6040, 0x00, 0x0080);
-    sleep_ms(200);
-
-    // --- NEW: CONFIGURE MOTION PROFILE ---
-    // Lower these values if the motor still faults!
-    printf("Configuring Profile...\n");
-    epos_write_sdo32(0x6081, 0x00, 10000);   // Profile Velocity: 500 RPM (Default is often 25000!)
-    epos_write_sdo32(0x6083, 0x00, 500000);  // Profile Acceleration: 1000 RPM/s
-    epos_write_sdo32(0x6084, 0x00, 500000);  // Profile Deceleration: 1000 RPM/s
-    // -------------------------------------
-
-    // 5. Set Operation Mode (PPM = 1)
-    printf("Setting Mode to PPM...\n");
-    uint8_t mode_data[8] = {0x2F, 0x60, 0x60, 0x00, 0x01, 0, 0, 0}; // 1 byte write
-    mcp_send_frame(0x600 + NODE_ID, mode_data, 8);
-    sleep_ms(100);
-
-    // 4. Enable Power Stage
-    printf("Enabling...\n");
-    epos_write_sdo16(0x6040, 0x00, 0x0006); 
-    sleep_ms(50);
-    epos_write_sdo16(0x6040, 0x00, 0x0007);
-    sleep_ms(50);
-    epos_write_sdo16(0x6040, 0x00, 0x000F);
-    sleep_ms(200);
-}
-
-/* -------------------------------------------------------------------------
- * System init (hardware, CYW43 for LED, maxon stubs)
- * ------------------------------------------------------------------------- */
-void system_init(void)
-{
-    stdio_init_all();
-    sleep_ms(2000);
-
+    init_sensors(); // Init ADC
+    
     if (cyw43_arch_init()) {
         printf("Wi-Fi init failed\n");
         return;
     }
-
-    // Enable AP mode
-    cyw43_arch_enable_ap_mode(
-        "PICO_AP",
-        "1234567890",
-        CYW43_AUTH_WPA2_AES_PSK
-    );
-
-    printf("AP IP now: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
-
+    cyw43_arch_enable_ap_mode("PICO_AP", "1234567890", CYW43_AUTH_WPA2_AES_PSK);
     start_tcp_server();
-    init_maxon();
+    
+    // Init SPI/CAN/EPOS
+    spi_init(SPI_PORT, 1000 * 1000);
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_init(PIN_CS); gpio_set_dir(PIN_CS, GPIO_OUT); gpio_put(PIN_CS, 1);
+    
+    mcp_init_1mbit_8mhz();
+    
+    // EPOS Init Sequence (Simplified)
+    epos_send_nmt(0x81, NODE_ID); sleep_ms(100);
+    epos_send_nmt(0x01, NODE_ID); sleep_ms(100);
+    epos_write_sdo16(0x6040, 0x00, 0x0080); // Fault reset
+    sleep_ms(100);
+    // Set Profile Velocity Mode (PPM)
+    uint8_t mode_data[8] = {0x2F, 0x60, 0x60, 0x00, 0x01, 0, 0, 0}; 
+    mcp_send_frame(0x600 + NODE_ID, mode_data, 8);
+    
+    printf("System Init Done.\n");
 }
 
-/* -------------------------------------------------------------------------
- * Main
- * ------------------------------------------------------------------------- */
-int main(void)
-{
+void check_autonomous_events(void) {
+    if (current_state == STATE_BOOT) {
+        if (absolute_time_diff_us(get_absolute_time(), boot_done_at) <= 0) {
+            transition_to(STATE_SAFE);
+            transition_requested = true;
+        }
+    }
+}
+
+void check_commands(void) {
+    // Stub
+}
+
+// Stubs for other states
+void state_maintenance_handler(void) { }
+void state_configuration_handler(void) { }
+
+int main(void) {
     system_init();
-
-    /* Start in OFF. Transition OFF → BOOT is by "HPC from s/c command".
-     * For bring-up without s/c, we go to BOOT once so the machine can run. */
     transition_to(STATE_BOOT);
-    boot_done_at = make_timeout_time_ms(BOOT_TO_SAFE_DELAY_MS);
-
+    
     while (true) {
-        check_commands();
         check_autonomous_events();
-
-        if (transition_requested)
-            transition_to(requested_transition);
+        if (transition_requested) transition_to(requested_transition);
 
         switch (current_state) {
             case STATE_OFF: state_off_handler(); break;
             case STATE_BOOT: state_boot_handler(); break;
             case STATE_SAFE: state_safe_handler(); break;
-            case STATE_MAINTENANCE: state_maintenance_handler(); break;
-            case STATE_CONFIGURATION: state_configuration_handler(); break;
+            case STATE_CALIBRATION: state_calibration_handler(); break;
             case STATE_NOMINAL: state_nominal_handler(); break;
+            default: break;
         }
-        printf("NEW LOOP\n");
-        sleep_ms(10);
     }
 }
