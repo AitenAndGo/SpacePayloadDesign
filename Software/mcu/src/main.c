@@ -31,6 +31,19 @@
 
 // EPOS4 Settings
 #define NODE_ID 1
+
+// MCP2515 Registers
+#define MCP_RESET       0xC0
+#define MCP_WRITE       0x02
+#define MCP_READ        0x03
+#define MCP_BITMOD      0x05
+#define MCP_CANCTRL     0x0F
+#define MCP_CNF1        0x2A
+#define MCP_CNF2        0x29
+#define MCP_CNF3        0x28
+#define MCP_RXB0CTRL    0x60
+#define MCP_CANINTF     0x2C
+
 #define INC_PER_DEGREE 3356.4444444
 
 // --------------------------------------------------------------------------
@@ -343,7 +356,7 @@ void state_calibration_handler(void) {
             // In reality, you'd want to find the CENTER of the high signal.
             
             // Debounce: check if this is far enough from the last one
-            int32_t current_pos = epos_read_sdo32(0x6064, 0x00); // Read actual position
+            int32_t current_pos = epos_read_sdo16(0x6064, 0x00); // Read actual position
             
             bool new_peak = true;
             for(int k=0; k<found_peaks; k++) {
@@ -429,7 +442,7 @@ void state_nominal_handler(void) {
 
 void system_init(void) {
     stdio_init_all();
-    sleep_ms(2000);
+    sleep_ms(20000);
     
     init_sensors(); // Init ADC
     
@@ -454,6 +467,12 @@ void system_init(void) {
     epos_send_nmt(0x01, NODE_ID); sleep_ms(100);
     epos_write_sdo16(0x6040, 0x00, 0x0080); // Fault reset
     sleep_ms(100);
+
+    printf("Configuring Motion Profile...\n");
+    epos_write_sdo32(0x6081, 0x00, 10000);   // Profile Velocity: 500 RPM
+    epos_write_sdo32(0x6083, 0x00, 500000);  // Profile Acceleration
+    epos_write_sdo32(0x6084, 0x00, 500000);  // Profile Deceleration
+
     // Set Profile Velocity Mode (PPM)
     uint8_t mode_data[8] = {0x2F, 0x60, 0x60, 0x00, 0x01, 0, 0, 0}; 
     mcp_send_frame(0x600 + NODE_ID, mode_data, 8);

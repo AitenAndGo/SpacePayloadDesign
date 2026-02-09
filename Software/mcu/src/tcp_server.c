@@ -4,7 +4,7 @@
 
 #define TCP_PORT TCP_SERVER_PORT
 
-static struct tcp_pcb *server_pcb;
+struct tcp_pcb *server_pcb;
 
 uint8_t checksum(const uint8_t *data, size_t len) {
     uint8_t cs = 0;
