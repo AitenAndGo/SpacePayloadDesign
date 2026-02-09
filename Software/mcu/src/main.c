@@ -223,6 +223,8 @@
 #define MCP_RXB0CTRL    0x60
 #define MCP_CANINTF     0x2C
 
+#define INC_PER_DEGREE 3356.4444444
+
 // --------------------------------------------------------------------------
 // LOW-LEVEL MCP2515 DRIVER
 // --------------------------------------------------------------------------
@@ -384,6 +386,64 @@ int32_t check_fault_code() {
     return epos_read_sdo16(0x603F, 0x00);
 }
 
+// Funkcja wykonująca ruch o zadaną liczbę stopni
+// degrees: liczba stopni (np. 90.0, -45.5).
+void move_motor_degrees(float degrees) {
+    // 1. Przelicz stopnie na inkrementy (rzutowanie na int32)
+    int32_t target_inc = (int32_t)(degrees * INC_PER_DEGREE);
+
+    printf("Ruch o %.2f stopni (%d inkrementow)...\n", degrees, target_inc);
+
+    // 2. Sprawdź status (czy silnik jest włączony?)
+    int32_t status = epos_read_sdo16(0x6041, 0x00);
+    if ((status & 0x0027) != 0x0027) {
+        printf("BLAD: Silnik nie jest wlaczony (Status: 0x%04X). Pomijam ruch.\n", status);
+        return;
+    }
+
+    // 3. Wyślij pozycję docelową do obiektu 0x607A
+    epos_write_sdo32(0x607A, 0x00, target_inc);
+
+    // 4. Wyzwól ruch (ControlWord)
+    // Bit 4 (0x10) = New Setpoint (musi przejść z 0 na 1)
+    // Bit 6 (0x40) = 1 (Ruch RELATYWNY - o zadaną odległość od obecnej)
+    // Jeśli wolisz ruch absolutny (do konkretnego kąta), ustaw bit 6 na 0.
+    
+    // Krok A: Reset bitu New Setpoint (na wszelki wypadek)
+    epos_write_sdo16(0x6040, 0x00, 0x000F); 
+    sleep_ms(10);
+
+    // Krok B: Ustawienie New Setpoint (0x10) + Relative (0x40) + Enable (0x0F) = 0x005F
+    epos_write_sdo16(0x6040, 0x00, 0x005F);
+
+    // 5. Czekaj na zakończenie ruchu (Opcjonalne - blokuje program do końca ruchu)
+    printf("Czekam na zakonczenie ruchu...\n");
+    sleep_ms(100); // Daj chwilę na rozpoczęcie, żeby bit Target Reached zdążył zgasnąć
+    
+    int timeout = 0;
+    while(timeout < 100) { // Timeout ok. 10 sekund (100 * 100ms)
+        status = epos_read_sdo16(0x6041, 0x00);
+        
+        // Sprawdź błąd (Fault)
+        if (status & 0x0008) {
+             printf("BLAD SILNIKA w trakcie ruchu! Status: 0x%04X\n", status);
+             return;
+        }
+
+        // Bit 10 (0x0400) = Target Reached (Cel osiągnięty)
+        if (status & 0x0400) {
+            printf("Cel osiagniety.\n");
+            break;
+        }
+        
+        sleep_ms(100);
+        timeout++;
+    }
+    
+    // Po zakończeniu zresetuj bit New Setpoint, żeby być gotowym na kolejny ruch
+    epos_write_sdo16(0x6040, 0x00, 0x000F);
+}
+
 // --------------------------------------------------------------------------
 // MAIN
 // --------------------------------------------------------------------------
@@ -468,24 +528,16 @@ int main() {
              continue;
         }
 
-        // Move 5000 counts (Smaller move for testing)
-        printf("Moving...\n");
-        epos_write_sdo32(0x607A, 0x00, 50000); 
-        
-        epos_write_sdo16(0x6040, 0x00, 0x000F); // Low
-        sleep_ms(10);
-        epos_write_sdo16(0x6040, 0x00, 0x005F); // High
-
+        // Obróć o 90 stopni
+        move_motor_degrees(90.0);
         sleep_ms(5000);
 
-        // Move Back
-        printf("Moving Back...\n");
-        epos_write_sdo32(0x607A, 0x00, -50000);
+        // Obróć o 180 stopni w drugą stronę
+        move_motor_degrees(-180.0);
+        sleep_ms(5000);
         
-        epos_write_sdo16(0x6040, 0x00, 0x000F);
-        sleep_ms(10);
-        epos_write_sdo16(0x6040, 0x00, 0x005F);
-
+        // Obróć o 1 stopień (precyzyjnie)
+        move_motor_degrees(90.0);
         sleep_ms(5000);
     }
     return 0;
