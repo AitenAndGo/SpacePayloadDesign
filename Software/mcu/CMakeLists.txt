@@ -22,8 +22,8 @@ pico_sdk_init()
 
 add_executable(optical_payload_app
     src/main.c
-    # src/maxon.c
-    # src/tcp_server.c
+    src/maxon.c
+    src/tcp_server.c
 )
 
 target_include_directories(optical_payload_app PRIVATE

@@ -8,6 +8,10 @@
 /* TCP listening port */
 #define TCP_SERVER_PORT 4242
 
+extern volatile int command;
+extern volatile int param1;
+extern volatile int param2;
+
 /* =========================
  * Public API
  * ========================= */
