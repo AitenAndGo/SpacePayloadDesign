@@ -47,6 +47,15 @@
 
 #define INC_PER_DEGREE 3356.4444444
 
+// Define max samples for the buffer
+#define MAX_SAMPLES 2000 
+
+// Structure for raw data
+typedef struct {
+    int32_t position;
+    uint16_t ir_value;
+} ScanPoint_t;
+
 // Zmienne globalne komend TCP
 volatile int command = -1; // -1 oznacza brak nowej komendy
 volatile int param1  = 0;
@@ -406,43 +415,135 @@ void state_safe_handler(void) {
 }
 
 void state_calibration_handler(void) {
-    printf("State CALIBRATION. Starting 360 scan...\n");
+    printf("State CALIBRATION. Starting continuous 360 scan with 90deg logic...\n");
+
+    // Static buffer to store the scan data
+    static ScanPoint_t scan_data[MAX_SAMPLES];
+    int sample_count = 0;
+
+    // Reset positions
+    for(int i=0; i<4; i++) filter_positions[i] = 0;
+
+    // --- PHASE 1: ACQUISITION (Spin & Record) ---
+    
+    // Check motor status
+    int32_t status = epos_read_sdo16(0x6041, 0x00);
+    if ((status & 0x0027) != 0x0027) {
+        printf("Error: Motor disabled. Go SAFE.\n");
+        transition_to(STATE_SAFE);
+        return;
+    }
+
+    // Move 360 degrees (Relative)
+    int32_t target_inc = (int32_t)(360.0 * INC_PER_DEGREE);
+    
+    printf(">> Moving 360 deg and recording...\n");
+    epos_write_sdo32(0x607A, 0x00, target_inc);
+    epos_write_sdo16(0x6040, 0x00, 0x000F); 
+    sleep_ms(10);
+    epos_write_sdo16(0x6040, 0x00, 0x005F); // Start Motion
+
+    // Polling loop
+    absolute_time_t timeout = make_timeout_time_ms(12000); // 12s timeout
+    while (sample_count < MAX_SAMPLES) {
+        status = epos_read_sdo16(0x6041, 0x00);
+        
+        // Read Pos & IR
+        scan_data[sample_count].position = epos_read_sdo32(0x6064, 0x00);
+        scan_data[sample_count].ir_value = read_sensor(0);
+        sample_count++;
+
+        if (status & 0x0400) break; // Target reached
+        if (absolute_time_diff_us(get_absolute_time(), timeout) < 0) break;
+        
+        sleep_ms(5); // Fast sampling (~200Hz)
+    }
+    // Stop & Clean flags
+    epos_write_sdo16(0x6040, 0x00, 0x000F);
+
+    // --- PHASE 2: ANALYSIS (Find 4 distinct peaks) ---
+    printf(">> Analyzing %d samples...\n", sample_count);
 
     int found_peaks = 0;
-    // Reset pozycji filtrów
-    for(int i=0;i<4;i++) filter_positions[i] = 0;
+    
+    // Helper to store the 'strength' of the peaks to compare them
+    uint16_t peak_min_values[4] = {4095, 4095, 4095, 4095};
 
-    // Skanowanie - 72 kroki po 5 stopni = 360 stopni
-    for (int i = 0; i < 72; i++) { 
-        move_motor_degrees(5.0); // Użycie Twojej funkcji
-        sleep_ms(50); 
-        
-        uint16_t ir_val = read_sensor(0); // Odczyt IR
-        
-        // Logika wykrywania okna (próg np. 2000)
-        if (ir_val > 2000) { 
-            int32_t current_pos = epos_read_sdo32(0x6064, 0x00);
-            
-            // Sprawdzenie czy to nie ten sam pik co przed chwilą (debounce)
-            bool new_peak = true;
-            for(int k=0; k<found_peaks; k++) {
-                if (abs(current_pos - filter_positions[k]) < (20.0 * INC_PER_DEGREE)) {
-                    new_peak = false;
-                    break;
+    bool inside_window = false;
+    uint16_t win_min_val = 4095;
+    int32_t win_best_pos = 0;
+    
+    // Threshold: < 2000 means "Light Detected" (Window)
+    const uint16_t THRESHOLD = 2000;
+    
+    // Minimum distance between windows to be considered distinct
+    // 60 degrees * increments_per_degree
+    const int32_t MIN_DIST_INC = (int32_t)(60.0 * INC_PER_DEGREE);
+
+    for (int i = 0; i < sample_count; i++) {
+        uint16_t val = scan_data[i].ir_value;
+        int32_t pos = scan_data[i].position;
+
+        if (val < THRESHOLD) {
+            // INSIDE WINDOW
+            if (!inside_window) {
+                inside_window = true;
+                win_min_val = val;
+                win_best_pos = pos;
+            } else {
+                // Tracking the lowest value (strongest light) in this window
+                if (val < win_min_val) {
+                    win_min_val = val;
+                    win_best_pos = pos;
                 }
             }
-            
-            if (new_peak && found_peaks < 4) {
-                printf("Window %d found at pos %d (IR: %d)\n", found_peaks, current_pos, ir_val);
-                filter_positions[found_peaks] = current_pos;
-                found_peaks++;
+        } else {
+            // OUTSIDE WINDOW (Signal went High / Dark)
+            if (inside_window) {
+                // We just finished passing a window. Now analyze it.
+                inside_window = false;
+
+                bool is_distinct = true;
+
+                // CHECK: Is this window close to the previous one?
+                if (found_peaks > 0) {
+                     int32_t dist = abs(win_best_pos - filter_positions[found_peaks - 1]);
+                     
+                     if (dist < MIN_DIST_INC) {
+                         // It is TOO CLOSE to be a new window (< 60 deg).
+                         // It might be noise or the same window split in two.
+                         is_distinct = false;
+                         
+                         // Logic: Keep the one with the STRONGER signal (lower value)
+                         if (win_min_val < peak_min_values[found_peaks - 1]) {
+                             printf("   -> Updating Window #%d (Better signal found at %d)\n", found_peaks-1, win_best_pos);
+                             filter_positions[found_peaks - 1] = win_best_pos;
+                             peak_min_values[found_peaks - 1] = win_min_val;
+                         } else {
+                             printf("   -> Ignoring noise at %d (We have better signal already)\n", win_best_pos);
+                         }
+                     }
+                }
+
+                // If distinct and we have space, add it
+                if (is_distinct && found_peaks < 4) {
+                    filter_positions[found_peaks] = win_best_pos;
+                    peak_min_values[found_peaks] = win_min_val;
+                    printf("  -> FOUND VALID WINDOW #%d at %d (Val: %d)\n", found_peaks, win_best_pos, win_min_val);
+                    found_peaks++;
+                }
             }
         }
     }
-    
-    printf("Calibration End. Found %d positions.\n", found_peaks);
-    is_calibrated = true;
-    transition_to(STATE_NOMINAL);
+
+    if (found_peaks == 4) {
+        printf("Calibration SUCCESS. 4 positions saved.\n");
+        is_calibrated = true;
+        transition_to(STATE_NOMINAL);
+    } else {
+        printf("Calibration FAILED. Found %d/4 windows.\n", found_peaks);
+        transition_to(STATE_NOMINAL);
+    }
 }
 
 void state_nominal_handler(void) {
