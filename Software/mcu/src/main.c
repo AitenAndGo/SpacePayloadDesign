@@ -316,6 +316,16 @@ void init_sensors() {
     printf("Sensors Initialized (UV=26, IR=27)\n");
 }
 
+uint16_t read_sensor_calibration(uint8_t id) {
+    // id 0 = IR (27), id 1 = UV (26)
+    if (id == 0) {
+        adc_select_input(1); 
+    } else {
+        adc_select_input(0); 
+    }
+    return adc_read();
+}
+
 uint16_t read_sensor(uint8_t id) {
     // Wybór kanału (bez zmian)
     if (id == 0) {
@@ -463,7 +473,7 @@ void state_calibration_handler(void) {
         
         // Read Pos & IR
         scan_data[sample_count].position = epos_read_sdo32(0x6064, 0x00);
-        scan_data[sample_count].ir_value = read_sensor(0);
+        scan_data[sample_count].ir_value = read_sensor_calibration(0);
         sample_count++;
 
         if (status & 0x0400) break; // Target reached
