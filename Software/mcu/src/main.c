@@ -334,19 +334,27 @@ uint16_t read_sensor(uint8_t id) {
         adc_select_input(0); // UV (GPIO 26)
     }
 
-    // --- UŚREDNIANIE ---
-    uint32_t sum = 0;
-    const int samples = 50; // Ilość próbek
+    // --- SZUKANIE WARTOŚCI MINIMALNEJ (Peak Detection - Active Low) ---
+    // Startujemy od maksymalnej możliwej wartości (4095 dla 12-bit ADC)
+    uint16_t min_val = 4095; 
     
-    // Robimy 50 pomiarów. Przy opóźnieniu 200us całość zajmie ok. 10ms.
-    // To wystarczy, żeby złapać "paczkę" danych z pilota.
+    // Zwiększyłem lekko czas próbkowania, żeby na pewno trafić w "mignięcie" pilota
+    const int samples = 100; 
+
     for (int i = 0; i < samples; i++) {
-        sum += adc_read();
-        sleep_us(10); 
+        uint16_t current_val = adc_read();
+        
+        // Jeśli znaleźliśmy wartość niższą (silniejsze światło), zapamiętujemy ją
+        if (current_val < min_val) {
+            min_val = current_val;
+        }
+        
+        // Krótkie opóźnienie, żeby rozłożyć pomiar w czasie (np. na 2-3ms)
+        sleep_us(20); 
     }
 
-    // Zwracamy średnią
-    return (uint16_t)(sum / samples);
+    // Zwracamy najniższą napotkaną wartość (najsilniejszy sygnał w tym oknie czasu)
+    return min_val;
 }
 
 // --------------------------------------------------------------------------
@@ -518,6 +526,7 @@ void state_calibration_handler(void) {
                 if (val < win_min_val) {
                     win_min_val = val;
                     win_best_pos = pos;
+                    printf("sensor values: %.2d ", val);
                 }
             }
         } else {
