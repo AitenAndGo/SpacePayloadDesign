@@ -118,7 +118,7 @@ def main():
                 cmd_type = 'CONTROL'
                 print("  Opcje: 0=Koło A (domyślne)")
                 p1 = 0 
-                p2 = int(input("  Podaj kąt: "))
+                p2 = int(input("  Podaj kąt (0-180 deg): "))
             
             else:
                 print("Nieznana komenda.")

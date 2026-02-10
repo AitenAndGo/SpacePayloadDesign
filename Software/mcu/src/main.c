@@ -317,13 +317,26 @@ void init_sensors() {
 }
 
 uint16_t read_sensor(uint8_t id) {
-    // id 0 = IR (27), id 1 = UV (26)
+    // Wybór kanału (bez zmian)
     if (id == 0) {
-        adc_select_input(1); 
+        adc_select_input(1); // IR (GPIO 27)
     } else {
-        adc_select_input(0); 
+        adc_select_input(0); // UV (GPIO 26)
     }
-    return adc_read();
+
+    // --- UŚREDNIANIE ---
+    uint32_t sum = 0;
+    const int samples = 50; // Ilość próbek
+    
+    // Robimy 50 pomiarów. Przy opóźnieniu 200us całość zajmie ok. 10ms.
+    // To wystarczy, żeby złapać "paczkę" danych z pilota.
+    for (int i = 0; i < samples; i++) {
+        sum += adc_read();
+        sleep_us(10); 
+    }
+
+    // Zwracamy średnią
+    return (uint16_t)(sum / samples);
 }
 
 // --------------------------------------------------------------------------
@@ -357,9 +370,9 @@ void init_maxon() {
 
     // 3. Configure Motion Profile (TO BYŁO KLUCZOWE)
     printf("Configuring Profile...\n");
-    epos_write_sdo32(0x6081, 0x00, 10000);   // Velocity
-    epos_write_sdo32(0x6083, 0x00, 500000);  // Accel
-    epos_write_sdo32(0x6084, 0x00, 500000);  // Decel
+    epos_write_sdo32(0x6081, 0x00, 5000);   // Velocity
+    epos_write_sdo32(0x6083, 0x00, 50000);  // Accel
+    epos_write_sdo32(0x6084, 0x00, 50000);  // Decel
 
     // 4. Set Operation Mode (PPM = 1)
     printf("Setting Mode to PPM...\n");
@@ -478,7 +491,7 @@ void state_calibration_handler(void) {
     
     // Minimum distance between windows to be considered distinct
     // 60 degrees * increments_per_degree
-    const int32_t MIN_DIST_INC = (int32_t)(60.0 * INC_PER_DEGREE);
+    const int32_t MIN_DIST_INC = (int32_t)(45.0 * INC_PER_DEGREE);
 
     for (int i = 0; i < sample_count; i++) {
         uint16_t val = scan_data[i].ir_value;
@@ -506,7 +519,7 @@ void state_calibration_handler(void) {
                 bool is_distinct = true;
 
                 // CHECK: Is this window close to the previous one?
-                if (found_peaks > 0) {
+                if (found_peaks > 0 && found_peaks < 4) {
                      int32_t dist = abs(win_best_pos - filter_positions[found_peaks - 1]);
                      
                      if (dist < MIN_DIST_INC) {
