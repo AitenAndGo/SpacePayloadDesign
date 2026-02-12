@@ -4,6 +4,7 @@
  */
 
 #include "app.h"
+#include "time.h"
 #include "maxon.h"
 #include "tcp_server.h"
 #include "pico/cyw43_arch.h"
@@ -339,18 +340,18 @@ uint16_t read_sensor(uint8_t id) {
     uint16_t min_val = 4095; 
     
     // Zwiększyłem lekko czas próbkowania, żeby na pewno trafić w "mignięcie" pilota
-    const int samples = 100; 
+    const int samples = 100000;
 
     for (int i = 0; i < samples; i++) {
         uint16_t current_val = adc_read();
-        
+
         // Jeśli znaleźliśmy wartość niższą (silniejsze światło), zapamiętujemy ją
         if (current_val < min_val) {
             min_val = current_val;
         }
-        
-        // Krótkie opóźnienie, żeby rozłożyć pomiar w czasie (np. na 2-3ms)
-        sleep_us(20); 
+
+        // Krótkie opóźnienie, żeby rozłożyć pomiar w czasies
+        sleep_us(10);
     }
 
     // Zwracamy najniższą napotkaną wartość (najsilniejszy sygnał w tym oknie czasu)
