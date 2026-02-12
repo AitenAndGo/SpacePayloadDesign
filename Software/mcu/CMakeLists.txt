@@ -35,6 +35,7 @@ target_link_libraries(optical_payload_app
     pico_stdlib
     pico_cyw43_arch_lwip_threadsafe_background
     hardware_spi
+    hardware_adc
 )
 
 pico_enable_stdio_usb(optical_payload_app 1)
